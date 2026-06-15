@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Depends,Request, Header, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Depends,Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
 import socket
@@ -17,7 +17,9 @@ import os
 import subprocess
 from dotenv import load_dotenv
 from typing import Optional
-from api_functions import setup_model_pool, pass_ocr_extraction,visa_ocr_extraction,eid_ocr_extraction,dl_ocr_extraction , e_visa_extraction ,get_medical_fitness_data, get_eid_application_details , mol_extraction ,get_status_change_data,get_insurance_card_details
+import uuid
+from typing import List
+from api_functions import setup_model_pool, pass_ocr_extraction,visa_ocr_extraction,eid_ocr_extraction,dl_ocr_extraction , e_visa_extraction ,get_medical_fitness_data, get_eid_application_details , mol_extraction ,get_status_change_data,get_insurance_card_details, DOC_HANDLERS
 
 # Implementation of Token Verification
 load_dotenv()
@@ -69,10 +71,96 @@ def whoami():
     return {"hostname": socket.gethostname()}
 
 
+# ----------------------------------------------------------------------------
+# Batch processing: submit many documents of one type, poll for results.
+# ----------------------------------------------------------------------------
+
+def bytes_to_image(filename, raw):
+    """Convert raw upload bytes to a PIL image (PDF -> first page @ 2x)."""
+    ext = filename.lower().split('.')[-1]
+    if ext in ('jpg', 'jpeg', 'png'):
+        return Image.open(BytesIO(raw))
+    if ext == 'pdf':
+        pdf_document = fitz.open(stream=raw, filetype="pdf")
+        pix = pdf_document.load_page(0).get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+        return Image.open(BytesIO(pix.tobytes("png")))
+    raise ValueError("Input file format must be 'jpg','jpeg','png' or 'pdf'.")
+
+
+# In-memory job store. NOTE: this lives in one process, so it breaks under
+# `docker-compose up --scale app=N` (the poll may hit a replica without the job).
+# Single replica is fine for now; use Redis for the scaled production setup.
+BATCH_JOBS = {}
+BATCH_CONCURRENCY = 5  # cap parallel Gemini calls so we don't exhaust the quota
+batch_sem = asyncio.Semaphore(BATCH_CONCURRENCY)
+
+
+async def _process_one(filename, raw, handler, output_lang, job):
+    async with batch_sem:
+        try:
+            image = bytes_to_image(filename, raw)
+            # The extraction fns are async but call the *blocking* Gemini SDK,
+            # so run each in its own thread to get real parallelism.
+            data, sts = await asyncio.to_thread(lambda: asyncio.run(handler(image, output_lang)))
+            ok = sts == 200
+            job["results"].append({
+                "filename": filename,
+                "sts": sts,
+                "data": data if ok else None,
+                "msg": "Success" if ok else "Document not suitable / extraction failed",
+            })
+        except Exception as e:
+            job["results"].append({"filename": filename, "sts": 500, "error": str(e)})
+        finally:
+            job["completed"] += 1
+
+
+async def run_batch(job_id, files_data, doc_type, output_lang):
+    job = BATCH_JOBS[job_id]
+    handler = DOC_HANDLERS[doc_type]
+    await asyncio.gather(*[
+        _process_one(name, raw, handler, output_lang, job) for name, raw in files_data
+    ])
+    job["status"] = "done"
+
+
+@app1.post("/extract_batch")
+@limiter.limit("5/minute")
+async def extract_batch(request: Request,
+                        doc_type: str = Form(...),
+                        output_lang: str = Form("original"),
+                        files: List[UploadFile] = File(...),
+                        _: None = Depends(verify_token)):
+    if doc_type not in DOC_HANDLERS:
+        return JSONResponse(
+            content={"error": f"Unknown doc_type. Allowed: {list(DOC_HANDLERS)}"},
+            status_code=400)
+    if not files:
+        return JSONResponse(content={"error": "No files provided"}, status_code=400)
+
+    # Read bytes NOW — UploadFile objects are closed once this handler returns.
+    files_data = [(f.filename, await f.read()) for f in files]
+    job_id = uuid.uuid4().hex
+    BATCH_JOBS[job_id] = {"status": "processing", "total": len(files_data),
+                          "completed": 0, "results": []}
+    asyncio.create_task(run_batch(job_id, files_data, doc_type, output_lang))
+    return JSONResponse(
+        content={"job_id": job_id, "status": "processing", "total": len(files_data)},
+        status_code=202)
+
+
+@app1.get("/batch_status/{job_id}")
+async def batch_status(job_id: str, _: None = Depends(verify_token)):
+    job = BATCH_JOBS.get(job_id)
+    if not job:
+        return JSONResponse(content={"error": "Unknown job_id"}, status_code=404)
+    return JSONResponse(content={"job_id": job_id, **job})
+
+
 # FastAPI route to handle the image upload and OCR extraction
 @app1.post("/extract_passport_details")
 @limiter.limit("5/minute")  # Limit to 5 requests per minute
-async def extract_pass_details(request: Request,image: UploadFile = File(...), _: None = Depends(verify_token)):
+async def extract_pass_details(request: Request,image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     try:
         await asyncio.sleep(1)
         if  not  image:
@@ -143,7 +231,7 @@ async def extract_pass_details(request: Request,image: UploadFile = File(...), _
             return JSONResponse(content={"error": "Input file format must be 'jpg','jpeg','png' or 'pdf'."},status_code=400)
 
         # Get OCR extraction result from the imported function
-        data, status_code = await pass_ocr_extraction(image)
+        data, status_code = await pass_ocr_extraction(image, output_lang)
         if status_code == 200:
             result = {"data": data, "sts": 200, "msg": "Success"}
             # Return the result as a JSON response
@@ -161,7 +249,7 @@ async def extract_pass_details(request: Request,image: UploadFile = File(...), _
 # FastAPI route to handle the image upload and OCR extraction
 @app1.post("/extract_visa_details")
 @limiter.limit("5/minute")  # Limit to 5 requests per minute
-async def extract_pvisa_details(request: Request,image: UploadFile = File(...), _: None = Depends(verify_token)):
+async def extract_pvisa_details(request: Request,image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     try:
         await asyncio.sleep(1)
         if  not  image:
@@ -231,7 +319,7 @@ async def extract_pvisa_details(request: Request,image: UploadFile = File(...), 
             return JSONResponse(content={"error": "Input file format must be 'jpg','jpeg','png' or 'pdf'."},status_code=400)
 
         # Get OCR extraction result from the imported function
-        data, status_code = await visa_ocr_extraction(image)
+        data, status_code = await visa_ocr_extraction(image, output_lang)
         if status_code == 200:
             result = {"data": data, "sts": 200, "msg": "Success"}
             # Return the result as a JSON response
@@ -249,7 +337,7 @@ async def extract_pvisa_details(request: Request,image: UploadFile = File(...), 
 # FastAPI route to handle the image upload and OCR extraction
 @app1.post("/extract_eid_details")
 @limiter.limit("5/minute")  # Limit to 5 requests per minute
-async def extract_emiratesid_details(request: Request,image: UploadFile = File(...),_: None = Depends(verify_token)):
+async def extract_emiratesid_details(request: Request,image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     try:
         await asyncio.sleep(1)
         if  not  image:
@@ -319,7 +407,7 @@ async def extract_emiratesid_details(request: Request,image: UploadFile = File(.
             return JSONResponse(content={"error": "Input file format must be 'jpg','jpeg','png' or 'pdf'."},status_code=400)
 
         # Get OCR extraction result from the imported function
-        data, status_code = await eid_ocr_extraction(image)
+        data, status_code = await eid_ocr_extraction(image, output_lang)
         if status_code == 200:
             result = {"data": data, "sts": 200, "msg": "Success"}
             # Return the result as a JSON response
@@ -337,7 +425,7 @@ async def extract_emiratesid_details(request: Request,image: UploadFile = File(.
 # FastAPI route to handle the image upload and OCR extraction
 @app1.post("/extract_dl_details")
 @limiter.limit("5/minute")  # Limit to 5 requests per minute
-async def extract_driving_license_details(request: Request,image: UploadFile = File(...),_: None = Depends(verify_token)):
+async def extract_driving_license_details(request: Request,image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     try:
         await asyncio.sleep(1)
         if  not  image:
@@ -407,7 +495,7 @@ async def extract_driving_license_details(request: Request,image: UploadFile = F
             return JSONResponse(content={"error": "Input file format must be 'jpg','jpeg','png' or 'pdf'."},status_code=400)
 
         # Get OCR extraction result from the imported function
-        data, status_code = await dl_ocr_extraction(image)
+        data, status_code = await dl_ocr_extraction(image, output_lang)
         if status_code == 200:
             result = {"data": data, "sts": 200, "msg": "Success"}
             # Return the result as a JSON response
@@ -425,7 +513,7 @@ async def extract_driving_license_details(request: Request,image: UploadFile = F
 # Testing the FastAPI app locally
 @app1.post("/extract_evisa_details")
 @limiter.limit("5/minute") # Limit to 5 requests per minute
-async def extract_e_visa_details(request: Request, image: UploadFile = File(...),_: None = Depends(verify_token)):
+async def extract_e_visa_details(request: Request, image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     try:
         await asyncio.sleep(1)
         if not image:
@@ -455,7 +543,7 @@ async def extract_e_visa_details(request: Request, image: UploadFile = File(...)
         else:
             return JSONResponse(content={"error": "Input file format must be 'jpg','jpeg','png' or 'pdf'."},status_code=400)
 
-        data, status_code = await e_visa_extraction(image)
+        data, status_code = await e_visa_extraction(image, output_lang)
         if status_code == 200:
             result = {"data": data, "sts": 200, "msg": "Success"}
             # Return the result as a JSON response
@@ -473,7 +561,7 @@ async def extract_e_visa_details(request: Request, image: UploadFile = File(...)
 
 @app1.post("/extract_medical_details")
 @limiter.limit("5/minute")  # Limit to 5 requests per minute
-async def medical_fitness_details_extraction(request: Request,image: UploadFile = File(...),_: None = Depends(verify_token)):
+async def medical_fitness_details_extraction(request: Request,image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     try:
         await asyncio.sleep(1)
         if  not  image:
@@ -502,7 +590,7 @@ async def medical_fitness_details_extraction(request: Request,image: UploadFile 
         else:
             return JSONResponse(content={"error": "Input file format must be 'jpg','jpeg','png' or 'pdf'."},status_code=400)
 
-        data, status_code = await get_medical_fitness_data(image)
+        data, status_code = await get_medical_fitness_data(image, output_lang)
         if status_code == 200:
             result = {"data": data, "sts": 200, "msg": "Success"}
             return JSONResponse(content=result, status_code=status_code)
@@ -518,7 +606,7 @@ async def medical_fitness_details_extraction(request: Request,image: UploadFile 
 
 @app1.post("/extract_eid_application_details")
 @limiter.limit("5/minute")  # Limit to 5 requests per minute
-async def extract_eid_application_details(request: Request, image: UploadFile = File(...),_: None = Depends(verify_token)):
+async def extract_eid_application_details(request: Request, image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     try:
         await asyncio.sleep(1)
         if not image:
@@ -548,7 +636,7 @@ async def extract_eid_application_details(request: Request, image: UploadFile = 
                                 status_code=400)
 
 
-        data, status_code = await get_eid_application_details(image)
+        data, status_code = await get_eid_application_details(image, output_lang)
         if status_code == 200:
             result = {"data": data, "sts": 200, "msg": "Success"}
             # Return the result as a JSON response
@@ -565,7 +653,7 @@ async def extract_eid_application_details(request: Request, image: UploadFile = 
 
 @app1.post("/extract_mol_mb_details")
 @limiter.limit("5/minute")  # Limit to 5 requests per minute
-async def extract_mol_details(request: Request, image: UploadFile = File(...),_: None = Depends(verify_token)):
+async def extract_mol_details(request: Request, image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     try:
         await asyncio.sleep(1)
         if not image:
@@ -594,7 +682,7 @@ async def extract_mol_details(request: Request, image: UploadFile = File(...),_:
             return JSONResponse(content={"error": "Input file format must be 'jpg', 'jpeg', 'png' or 'pdf'."}, status_code=400)
 
         # Calling  an external function to extract MOL data from the image
-        data, status_code = await mol_extraction(image)
+        data, status_code = await mol_extraction(image, output_lang)
 
         if status_code == 200:
             mol_number_start = data["mol_number"].lower().startswith("mb")
@@ -620,7 +708,7 @@ async def extract_mol_details(request: Request, image: UploadFile = File(...),_:
 
 @app1.post("/extract_mol_st_details")
 @limiter.limit("5/minute")  # Limit to 5 requests per minute
-async def extract_mol_st_details(request: Request, image: UploadFile = File(...),_: None = Depends(verify_token)):
+async def extract_mol_st_details(request: Request, image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     try:
         await asyncio.sleep(1)
         if not image:
@@ -649,7 +737,7 @@ async def extract_mol_st_details(request: Request, image: UploadFile = File(...)
             return JSONResponse(content={"error": "Input file format must be 'jpg', 'jpeg', 'png' or 'pdf'."}, status_code=400)
 
         # Calling  an external function to extract MOL data from the image
-        data, status_code = await mol_extraction(image)
+        data, status_code = await mol_extraction(image, output_lang)
 
         if status_code == 200:
             mol_number_start = data["mol_number"].lower().startswith("st")
@@ -675,7 +763,7 @@ async def extract_mol_st_details(request: Request, image: UploadFile = File(...)
 
 @app1.post("/extract_change_status_details")
 @limiter.limit("5/minute")  # Limit to 5 requests per minute
-async def extract_status_change_details(request: Request,image: UploadFile = File(...),_: None = Depends(verify_token)):
+async def extract_status_change_details(request: Request,image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     try:
         await asyncio.sleep(1)
         if  not  image:
@@ -710,7 +798,7 @@ async def extract_status_change_details(request: Request,image: UploadFile = Fil
             return JSONResponse(content={"error": "Input file format must be 'jpg','jpeg','png' or 'pdf'."},status_code=400)
 
         # Calling  an external function to extract MOL data from the image
-        data, status_code = await get_status_change_data(image)
+        data, status_code = await get_status_change_data(image, output_lang)
         if status_code == 200:
             result = {"data": data, "sts": 200, "msg": "Success"}
             return JSONResponse(content=result, status_code=status_code)
@@ -727,7 +815,7 @@ async def extract_status_change_details(request: Request,image: UploadFile = Fil
 
 @app1.post("/extract_insurance_details")
 @limiter.limit("5/minute") # Limit to 5 requests per minute
-async def extract_insurance_card_details(request: Request,image: UploadFile = File(...),_: None = Depends(verify_token)):
+async def extract_insurance_card_details(request: Request,image: UploadFile = File(...), output_lang: str = Form("original"), _: None = Depends(verify_token)):
     print("Rate limit key:", get_remote_address(request))
     try:
         await asyncio.sleep(1)
@@ -760,7 +848,7 @@ async def extract_insurance_card_details(request: Request,image: UploadFile = Fi
             return JSONResponse(content={"error": "Input file format must be 'jpg','jpeg','png' or 'pdf'."},status_code=400)
 
         # Calling  an external function to extract MOL data from the image
-        data, status_code = await get_insurance_card_details(image)
+        data, status_code = await get_insurance_card_details(image, output_lang)
         if status_code == 200:
             result = {"data": data, "sts": 200, "msg": "Success"}
             return JSONResponse(content=result, status_code=status_code)
