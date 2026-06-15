@@ -1,7 +1,7 @@
 # OCR Extraction Microservice
 ### GenAI-Powered Document Intelligence 🚀
 
-A high-performance, production-ready microservice for extracting structured data from official documents using Google Gemini Vision AI and FastAPI.
+A high-performance, production-ready microservice for extracting structured data from official documents using Google Gemini (multimodal) and FastAPI.
 
 [Documentation](#documentation) • [Installation](#installation) • [Usage](#usage) • [Features](#features) • [Contributing](#contributing)
 
@@ -9,7 +9,7 @@ A high-performance, production-ready microservice for extracting structured data
 
 ## ✨ Overview
 
-**OCR Extraction** is a robust microservice designed to transform unstructured document images (Passports, Visas, Emirates IDs) into structured, validated JSON data. Built with **FastAPI** and **Google Gemini Vision**, it leverages the power of Multimodal LLMs to handle complex OCR tasks that traditional methods struggle with, such as:
+**OCR Extraction** is a robust microservice designed to transform unstructured document images (Passports, Visas, Emirates IDs) into structured, validated JSON data. Built with **FastAPI** and **Google Gemini**, it leverages the power of multimodal LLMs to handle complex OCR tasks that traditional methods struggle with, such as:
 
 *   **🔍 Multi-Format Support:** Handles JPG, PNG, and PDF files automatically.
 *   **🧠 Intelligent Extraction:** Uses context-aware AI to correct orientation and disambiguate characters (e.g., '1' vs 'I').
@@ -28,6 +28,8 @@ A high-performance, production-ready microservice for extracting structured data
 | **💳 ID Card OCR**    | specialized extraction for Emirates IDs and standard ID cards.   | Name, ID Number, Expiry, Nationality. |
 | **📄 PDF Processing** | Auto-converts PDF documents to high-res images for analysis.     | Seamless handling of multi-page PDFs. |
 | **🛡️ MRZ Logic**      | Custom logic to parse and validate Machine Readable Zones (MRZ). | Cleaned, pattern-validated strings.   |
+| **🌐 Multi-Language** | Selectable output language (English, Arabic, Hindi, French, German) via an `output_lang` field; defaults to the document's original script. | JSON in the requested language; IDs/dates left as printed. |
+| **📚 Batch Processing** | Submit many documents of one type in a single request; processed concurrently as a background job. | A `job_id` to poll for per-file results. |
 
 ### 🚀 Performance & Security
 
@@ -47,8 +49,8 @@ graph TD;
     Nginx-->FastAPI;
     FastAPI-->Auth_Layer;
     Auth_Layer-->Rate_Limiter;
-    Rate_Limiter-->Gemini_Vision_API;
-    Gemini_Vision_API-->Structured_JSON;
+    Rate_Limiter-->Gemini_API;
+    Gemini_API-->Structured_JSON;
 ```
 
 ```text
@@ -77,7 +79,7 @@ graph TD;
 │             │                            │                  │
 │             ▼                            ▼                  │
 │  ┌───────────────────────────────────────────────────┐      │
-│  │          Google Gemini Vision API                 │      │
+│  │             Google Gemini API                     │      │
 │  │  • Multi-modal LLM Processing                     │      │
 │  │  • Context-aware OCR & Extraction                 │      │
 │  └───────────────────────────────────────────────────┘      │
@@ -172,6 +174,49 @@ response = requests.post(url, headers=headers, files=files)
 print(response.json())
 ```
 
+### Multi-Language Output
+
+Pass an `output_lang` form field to choose the output language. Omit it (or send
+`original`) to get the text exactly as printed on the document. Supported codes:
+`en`, `ar`, `hi`, `fr`, `de`. IDs, document numbers, and dates are always left
+as printed, regardless of language.
+
+```python
+response = requests.post(
+    url,
+    headers={"Authorization": "your_secret_token"},
+    files={"image": open("path/to/passport.jpg", "rb")},
+    data={"output_lang": "en"},   # force English; default is "original"
+)
+```
+
+### Batch Processing
+
+Submit many documents of one type in a single request. The server returns a
+`job_id` immediately and processes the files concurrently in the background;
+poll `/batch_status/{job_id}` until `status` is `done`.
+
+```python
+# 1. Submit a batch
+resp = requests.post(
+    "http://localhost:8000/extract_batch",
+    headers={"Authorization": "your_secret_token"},
+    data={"doc_type": "passport", "output_lang": "original"},
+    files=[("files", open("p1.jpg", "rb")), ("files", open("p2.pdf", "rb"))],
+)
+job_id = resp.json()["job_id"]
+
+# 2. Poll for results
+status = requests.get(
+    f"http://localhost:8000/batch_status/{job_id}",
+    headers={"Authorization": "your_secret_token"},
+).json()
+# -> {"status": "done", "total": 2, "completed": 2, "results": [ {filename, sts, data}, ... ]}
+```
+
+Valid `doc_type` values: `passport`, `visa`, `emirates_id`, `driving_license`,
+`e_visa`, `medical`, `eid_application`, `mol`, `status_change`, `insurance`.
+
 ### Supported Endpoints
 
 | Endpoint                       | Method | Description                            |
@@ -179,6 +224,8 @@ print(response.json())
 | `/extract_passport_details`    | `POST` | Extract data from Passport images/PDFs |
 | `/extract_visa_details`        | `POST` | Extract data from Visa documents       |
 | `/extract_emirates_id_details` | `POST` | Extract data from Emirates ID cards    |
+| `/extract_batch`               | `POST` | Submit many documents of one `doc_type`; returns a `job_id` |
+| `/batch_status/{job_id}`       | `GET`  | Poll batch progress and per-file results |
 | `/health`                      | `GET`  | Server health check status             |
 
 ---
@@ -219,7 +266,7 @@ To see detailed logs, ensure your environment is not suppressing output. The app
 ## 🎓 Technology Stack
 
 *   **Framework:** FastAPI
-*   **AI Model:** Google Gemini 1.5 Flash / Pro
+*   **AI Model:** Google Gemini 2.5 Flash (multimodal)
 *   **Image Processing:** Pillow (PIL), PyMuPDF (Fitz)
 *   **Server:** Uvicorn
 *   **Proxy:** Nginx
@@ -235,5 +282,5 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 🙏 Acknowledgments
 
-*   **Google DeepMind** for the Gemini Vision API.
+*   **Google DeepMind** for the Gemini API.
 *   **Tiangolo** for the amazing FastAPI framework.
