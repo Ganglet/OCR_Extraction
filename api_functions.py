@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import unicodedata
 import requests
 from io import BytesIO
 import google.generativeai as genai
@@ -41,26 +42,25 @@ def initialize_gemini_model():
     return random.choice(gemini_model_pool)
 
 def clean_alphanum(value):
-    """Keep only alphanumeric characters and single spaces between words"""
+    """Keep letters (any script) + digits + single spaces.
+
+    Uses Unicode categories so Arabic/Devanagari survive: L=letter, M=combining
+    mark (e.g. Hindi vowel signs like 'ो'), N=number. Drops punctuation/symbols.
+    """
     if value is None:
         return None
-    # Remove all non-alphanumeric and non-space characters
-    cleaned = re.sub(r'[^A-Za-z0-9 ]+', '', value)
-    # Replace multiple spaces with a single space
+    cleaned = ''.join(c for c in value
+                      if c == ' ' or unicodedata.category(c)[0] in ('L', 'M', 'N'))
     cleaned = re.sub(r'\s+', ' ', cleaned)
-    # Strip leading/trailing spaces
     return cleaned.strip()
 
 def clean_alpha(value):
-    """Keep only alphanumeric characters and single spaces between words"""
+    """Keep letters (any script) + single spaces. Drops digits, unlike clean_alphanum."""
     if value is None:
         return None
-    """Keep only alphabetic characters and single spaces between words"""
-    # Remove everything except letters and spaces
-    cleaned = re.sub(r'[^A-Za-z ]+', '', value)
-    # Normalize multiple spaces to a single space
+    cleaned = ''.join(c for c in value
+                      if c == ' ' or unicodedata.category(c)[0] in ('L', 'M'))
     cleaned = re.sub(r'\s+', ' ', cleaned)
-    # Trim leading/trailing spaces
     return cleaned.strip()
 
 
@@ -72,8 +72,23 @@ def extract_policy_number(card_no):
     return match.group(1) if match else None
 
 
+# Map of supported output-language codes -> human name used in the prompt.
+# Anything else (including "original") means: return text as printed, no translation.
+_LANG_NAMES = {"en": "English", "ar": "Arabic", "hi": "Hindi",
+               "fr": "French", "de": "German"}
+
+def language_instruction(output_lang):
+    """Return a prompt suffix forcing the requested output language, or '' for original."""
+    lang = _LANG_NAMES.get((output_lang or "").lower())
+    if not lang:
+        return ""
+    return (f"\nReturn all human-readable text fields (such as name, surname, "
+            f"profession, place, sponsor) in {lang}. Keep document numbers, IDs, "
+            f"dates, and country codes exactly as printed — do not translate them.")
+
+
 # Asynchronous OCR function using Google API
-async def pass_ocr_extraction(image_input):
+async def pass_ocr_extraction(image_input, output_lang="original"):
     model = initialize_gemini_model()
     image = image_input
     # Prepare the prompt for the Gemini Pro Vision model
@@ -107,6 +122,7 @@ async def pass_ocr_extraction(image_input):
 
 
     # Make the Gemini Pro Vision API call
+    prompt = prompt + language_instruction(output_lang)
     response = model.generate_content([prompt, image])
     raw_content = response.text
 
@@ -147,7 +163,7 @@ async def pass_ocr_extraction(image_input):
         return data, 400
 
 # Asynchronous OCR function using Google API
-async def visa_ocr_extraction(image_input):
+async def visa_ocr_extraction(image_input, output_lang="original"):
     model = initialize_gemini_model()
     image = image_input
 
@@ -176,6 +192,7 @@ async def visa_ocr_extraction(image_input):
                 """
 
     # Make the Gemini Pro Vision API call
+    prompt = prompt + language_instruction(output_lang)
     response = model.generate_content([prompt, image])
     raw_content = response.text
 
@@ -216,7 +233,7 @@ async def visa_ocr_extraction(image_input):
         return data, 400
 
 # Asynchronous OCR function using Google API
-async def eid_ocr_extraction(image_input):
+async def eid_ocr_extraction(image_input, output_lang="original"):
     model = initialize_gemini_model()
     image = image_input
 
@@ -241,6 +258,7 @@ async def eid_ocr_extraction(image_input):
                     """
 
     # Make the Gemini Pro Vision API call
+    prompt = prompt + language_instruction(output_lang)
     response = model.generate_content([prompt, image])
     raw_content = response.text
 
@@ -282,7 +300,7 @@ async def eid_ocr_extraction(image_input):
         return data, 400
 
 # Asynchronous OCR function using Google API
-async def dl_ocr_extraction(image_input):
+async def dl_ocr_extraction(image_input, output_lang="original"):
     model = initialize_gemini_model()
     image = image_input
 
@@ -307,6 +325,7 @@ async def dl_ocr_extraction(image_input):
 
 
     # Make the Gemini Pro Vision API call
+    prompt = prompt + language_instruction(output_lang)
     response = model.generate_content([prompt, image])
     raw_content = response.text
 
@@ -347,7 +366,7 @@ async def dl_ocr_extraction(image_input):
         return data, 400
 
 
-async def e_visa_extraction(image_input):
+async def e_visa_extraction(image_input, output_lang="original"):
     model = initialize_gemini_model()
     image=image_input
     prompt = """
@@ -373,6 +392,7 @@ async def e_visa_extraction(image_input):
                         If any parameter is missing or unclear, return null instead of guessing the value.
                         """
 
+    prompt = prompt + language_instruction(output_lang)
     response = model.generate_content([prompt, image])
     raw_content = response.text
     # # Remove Markdown-style JSON formatting if present
@@ -408,7 +428,7 @@ async def e_visa_extraction(image_input):
             return data, 400
 
 
-async def get_medical_fitness_data(image_input):
+async def get_medical_fitness_data(image_input, output_lang="original"):
     model = initialize_gemini_model()
     image = image_input
     # Prepare the prompt for the Gemini Pro Vision model
@@ -431,6 +451,7 @@ async def get_medical_fitness_data(image_input):
               """
 
               # Make the Gemini Pro Vision API call
+    prompt = prompt + language_instruction(output_lang)
     response = model.generate_content([prompt, image])
     raw_content = response.text
     print(raw_content)
@@ -463,7 +484,7 @@ async def get_medical_fitness_data(image_input):
         return data, 400
 
 
-async def get_eid_application_details(image_input):
+async def get_eid_application_details(image_input, output_lang="original"):
     model = initialize_gemini_model()
     image = image_input
     prompt = """
@@ -496,6 +517,7 @@ async def get_eid_application_details(image_input):
         If any parameter is missing or unclear, return null instead of guessing the value.
         """
 
+    prompt = prompt + language_instruction(output_lang)
     response = model.generate_content([prompt, image])
     raw_content = response.text
     print(raw_content)
@@ -543,7 +565,7 @@ async def get_eid_application_details(image_input):
         return data, 400
 
 
-async def mol_extraction(image_input):
+async def mol_extraction(image_input, output_lang="original"):
     model = initialize_gemini_model()
     image = image_input
     prompt = """
@@ -574,6 +596,7 @@ async def mol_extraction(image_input):
         If any parameter is missing or unclear, return null instead of guessing the value.
     """
 
+    prompt = prompt + language_instruction(output_lang)
     response = model.generate_content([prompt, image])
     raw_content = response.text
     print(raw_content)
@@ -616,7 +639,7 @@ async def mol_extraction(image_input):
         return data, 400
 
 
-async def get_status_change_data(image_input):
+async def get_status_change_data(image_input, output_lang="original"):
     model = initialize_gemini_model()
     image = image_input
     # Prepare the prompt for the Gemini Pro Vision model
@@ -643,6 +666,7 @@ async def get_status_change_data(image_input):
               """
 
     # Make the Gemini Pro Vision API call
+    prompt = prompt + language_instruction(output_lang)
     response = model.generate_content([prompt, image])
     raw_content = response.text
     print(raw_content)
@@ -676,7 +700,7 @@ async def get_status_change_data(image_input):
         return data, 400
 
 
-async def get_insurance_card_details(image_input):
+async def get_insurance_card_details(image_input, output_lang="original"):
     model = initialize_gemini_model()
     image = image_input
 
@@ -704,6 +728,7 @@ async def get_insurance_card_details(image_input):
                   In the provided image, dates like 'Birth', 'Valid From', 'Valid till' are in DD-MM-YYYY format but return them in YYYY-MM-DD format in respective fields.
                   Ensure the extracted text is accurate. If a field is missing or unclear, return null.
           """
+    prompt = prompt + language_instruction(output_lang)
     response = model.generate_content([prompt, image])
     raw_content = response.text
     print(raw_content)
@@ -746,6 +771,22 @@ async def get_insurance_card_details(image_input):
     else:
         data = raw_content
         return data, 400
+
+# Maps a batch doc_type to its extraction function. All handlers share the
+# (image, output_lang) -> (data, status_code) signature, so dispatch is uniform.
+DOC_HANDLERS = {
+    "passport": pass_ocr_extraction,
+    "visa": visa_ocr_extraction,
+    "emirates_id": eid_ocr_extraction,
+    "driving_license": dl_ocr_extraction,
+    "e_visa": e_visa_extraction,
+    "medical": get_medical_fitness_data,
+    "eid_application": get_eid_application_details,
+    "mol": mol_extraction,
+    "status_change": get_status_change_data,
+    "insurance": get_insurance_card_details,
+}
+
 
 # Testing the functions in passport_ocr.py
 if __name__ == "__main__":
