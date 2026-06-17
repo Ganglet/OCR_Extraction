@@ -1,3 +1,9 @@
+# Test document dataset — contains real PII (passports, visas, Emirates IDs).
+# Never commit.
+OCR_document_for_testing/
+OCR_document_for_testing.rar
+*.rar
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
