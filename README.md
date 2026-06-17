@@ -30,6 +30,7 @@ A high-performance, production-ready microservice for extracting structured data
 | **🛡️ MRZ Logic**      | Custom logic to parse and validate Machine Readable Zones (MRZ). | Cleaned, pattern-validated strings.   |
 | **🌐 Multi-Language** | Selectable output language (English, Arabic, Hindi, French, German) via an `output_lang` field; defaults to the document's original script. | JSON in the requested language; IDs/dates left as printed. |
 | **📚 Batch Processing** | Submit many documents of one type in a single request; processed concurrently as a background job. | A `job_id` to poll for per-file results. |
+| **💬 Document Chatbot** | Upload a document once, then ask free-form questions about it (powered by OpenRouter / Qwen3-VL). | Natural-language answers grounded in the image. |
 
 ### 🚀 Performance & Security
 
@@ -125,6 +126,10 @@ graph TD;
     GOOGLE_API_KEY=your_gemini_api_key
     # Add multiple keys if available for load balancing
     GOOGLE_API_KEY_2=your_second_key
+    # For the document chatbot (OpenRouter):
+    OPENROUTER_API_KEY=your_openrouter_key
+    # Optional: override the pinned chatbot model
+    # CHATBOT_MODEL=qwen/qwen3-vl-30b-a3b-instruct
     ```
 
 5.  **Run the application**
@@ -217,6 +222,32 @@ status = requests.get(
 Valid `doc_type` values: `passport`, `visa`, `emirates_id`, `driving_license`,
 `e_visa`, `medical`, `eid_application`, `mol`, `status_change`, `insurance`.
 
+### Document Chatbot
+
+Upload a document **once**, then ask as many free-form questions about it as you
+like — each question only sends the lightweight `session_id`, not the image
+again. Powered by OpenRouter (default model `qwen/qwen3-vl-30b-a3b-instruct`);
+requires `OPENROUTER_API_KEY` in `.env`.
+
+```python
+h = {"Authorization": "your_secret_token"}
+
+# 1. Upload once -> get a session_id
+sid = requests.post("http://localhost:8000/chat/upload",
+                    headers=h,
+                    files={"image": open("passport.jpg", "rb")}).json()["session_id"]
+
+# 2. Ask any number of questions against that session_id
+for q in ["What is the full name?", "Is this document expired?", "Which country issued it?"]:
+    ans = requests.post("http://localhost:8000/chat",
+                        headers=h,
+                        data={"session_id": sid, "question": q}).json()
+    print(q, "->", ans["answer"])
+```
+
+The bot answers strictly from the document image and says so when an answer
+isn't visible. Questions are independent (no conversation memory).
+
 ### Supported Endpoints
 
 | Endpoint                       | Method | Description                            |
@@ -226,6 +257,8 @@ Valid `doc_type` values: `passport`, `visa`, `emirates_id`, `driving_license`,
 | `/extract_emirates_id_details` | `POST` | Extract data from Emirates ID cards    |
 | `/extract_batch`               | `POST` | Submit many documents of one `doc_type`; returns a `job_id` |
 | `/batch_status/{job_id}`       | `GET`  | Poll batch progress and per-file results |
+| `/chat/upload`                 | `POST` | Upload a document for the chatbot; returns a `session_id` |
+| `/chat`                        | `POST` | Ask a question about a `session_id`'s document |
 | `/health`                      | `GET`  | Server health check status             |
 
 ---
@@ -266,7 +299,8 @@ To see detailed logs, ensure your environment is not suppressing output. The app
 ## 🎓 Technology Stack
 
 *   **Framework:** FastAPI
-*   **AI Model:** Google Gemini 2.5 Flash (multimodal)
+*   **AI Model (extraction):** Google Gemini 2.5 Flash (multimodal)
+*   **AI Model (chatbot):** OpenRouter — Qwen3-VL 30B A3B Instruct (configurable)
 *   **Image Processing:** Pillow (PIL), PyMuPDF (Fitz)
 *   **Server:** Uvicorn
 *   **Proxy:** Nginx
