@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from typing import Optional
 import uuid
 from typing import List
+import chatbot
 from api_functions import setup_model_pool, pass_ocr_extraction,visa_ocr_extraction,eid_ocr_extraction,dl_ocr_extraction , e_visa_extraction ,get_medical_fitness_data, get_eid_application_details , mol_extraction ,get_status_change_data,get_insurance_card_details, DOC_HANDLERS
 
 # Implementation of Token Verification
@@ -155,6 +156,40 @@ async def batch_status(job_id: str, _: None = Depends(verify_token)):
     if not job:
         return JSONResponse(content={"error": "Unknown job_id"}, status_code=404)
     return JSONResponse(content={"job_id": job_id, **job})
+
+
+# ----------------------------------------------------------------------------
+# Document chatbot (OpenRouter / Qwen3-VL): upload once, then ask many questions.
+# Independent of the Gemini extraction endpoints above.
+# ----------------------------------------------------------------------------
+
+@app1.post("/chat/upload")
+@limiter.limit("10/minute")
+async def chat_upload(request: Request, image: UploadFile = File(...),
+                      _: None = Depends(verify_token)):
+    if image.filename == '':
+        return JSONResponse(content={"error": "No selected file"}, status_code=400)
+    raw = await image.read()
+    try:
+        data_url = chatbot.to_data_url(image.filename, raw)
+    except ValueError as e:
+        return JSONResponse(content={"error": str(e)}, status_code=400)
+    return JSONResponse(content={"session_id": chatbot.create_session(data_url)})
+
+
+@app1.post("/chat")
+@limiter.limit("20/minute")  # higher than extraction: asking many questions is the point
+async def chat(request: Request, session_id: str = Form(...), question: str = Form(...),
+               _: None = Depends(verify_token)):
+    try:
+        # requests.post inside chatbot.ask is blocking -> run off the event loop
+        answer = await asyncio.to_thread(chatbot.ask, session_id, question)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=502)
+    if answer is None:
+        return JSONResponse(content={"error": "Unknown or expired session_id"}, status_code=404)
+    return JSONResponse(content={"session_id": session_id, "question": question,
+                                 "answer": answer, "model": chatbot.CHATBOT_MODEL})
 
 
 # FastAPI route to handle the image upload and OCR extraction
